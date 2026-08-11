@@ -23,10 +23,8 @@ sequenceDiagram
 
     U->>H: {annotationId, base_url, token, settings}
     Note over H: validate payload, incl. the sink URL
-    opt queue unknown
-        H->>R: GET /annotations/{id}
-        R-->>H: queue URL
-    end
+    H->>R: GET /annotations/{id}
+    R-->>H: queue URL
     H->>R: GET /queues/{qid}/export?format=json&id={id}
     R-->>H: export JSON
     Note over H: parse → map → serialize → base64
@@ -63,13 +61,6 @@ There is no separate field-order table, no list of candidate aliases, and no
 guessing. Adding an element is one line. `_src()` with no argument marks a value
 that is derived in code rather than read from the export.
 
-A queue with a customised schema doesn't need a code change — it passes
-`settings.schema_overrides`:
-
-```json
-{ "schema_overrides": { "CustormerID": "recipient_vat_id" } }
-```
-
 **Nothing is calculated.** Every amount, rate and total comes from the export as
 extracted. Where Rossum has no value, the element is emitted empty rather than
 inferred — an invented tax rate is worse than a blank one.
@@ -93,6 +84,7 @@ inferred — an invented tax rate is worse than a blank one.
 | `Control.CurrentDate` | *derived* — UTC date of the run |
 | `Control.Barcode` | `barcode`, falling back to the annotation ID |
 | `Lines/*` | the `line_items` rows (`item_code`, `item_description`, `item_quantity`, `item_uom`, `item_amount`, `item_rate`, `item_tax`, `item_amount_total`) |
+| `Lines/Discount`, `Control.EmailTo` / `EmailFrom` | no standard Rossum `schema_id` — always emitted empty |
 
 If no `tax_details` rows were extracted, the header totals `amount_total_base` /
 `amount_total_tax` fill bucket 1 and `TaxRate1` stays empty.
@@ -143,7 +135,7 @@ stored setting, so a test run can target a fresh bin without mutating the hook:
 | Path | Role |
 |---|---|
 | `function.py` | The function — paste this into Rossum |
-| `tests/test_function.py` | 52 offline tests; no network |
+| `tests/test_function.py` | 49 offline tests; no network |
 | `samples/sample_export.json` | Rossum export fixture used by the tests |
 | `samples/sample_invoke_payload.json` | Shape of a manual-invoke payload |
 | `scripts/local_smoke.py` | Map the fixture and print the XML — no account needed |
@@ -156,7 +148,7 @@ stored setting, so a test run can target a fresh bin without mutating the hook:
 The function is stdlib + `requests`; the tests need nothing else.
 
 ```bash
-python -m unittest discover -s tests -v      # 52 tests
+python -m unittest discover -s tests -v      # 49 tests
 python scripts/local_smoke.py                # eyeball the mapped XML
 ```
 
@@ -194,12 +186,6 @@ that cannot be re-parsed. It is also a *parsing* library, and this function neve
 parses XML — it generates it from Rossum's JSON export. ElementTree does that in
 a dozen lines with one sanitisation gate that every value passes through.
 
-**No Rossum SDK.** The runtime's `rossum` package is the CLI, not the
-`rossum-api` client library; its client is built around username/password login,
-sends `Authorization: Token`, has no request timeout, and revokes the token in
-its context-manager exit. For two documented REST calls, a ~40-line client with
-explicit timeouts and no redirect-following is the safer dependency.
-
 **The handler never raises.** Every path returns hook messages, because an
 uncaught exception in a Rossum function surfaces as an opaque failure. Error
 messages name the endpoint and the likely cause — `postbin_url` is validated
@@ -209,13 +195,12 @@ trips and a POST of invoice data to an arbitrary host.
 **Timeouts.** `POST /hooks/{id}/invoke` enforces a hard 30s wall clock that
 cannot be raised, and the injected token lives ~10 minutes. At most three
 sequential requests run, each capped at 8s, leaving room to return an error
-rather than being killed. Redirects are refused: following one would both re-arm
-the timeout and forward the bearer token to another host.
+rather than being killed.
 
 ### Limitations
 
 - `Discount` and `Control.EmailTo` / `EmailFrom` have no standard Rossum
-  `schema_id`; they stay empty unless pointed at a field via `schema_overrides`.
+  `schema_id`; they are always emitted empty.
 - Only the first three rated tax buckets are emitted — the target schema has
   exactly three.
 - The annotation must be in an exportable state; if it isn't, the export returns

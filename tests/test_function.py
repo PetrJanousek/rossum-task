@@ -16,7 +16,6 @@ import requests
 
 import function
 from function import (
-    Config,
     Control,
     EInvoice,
     Line,
@@ -264,16 +263,13 @@ class MappingTests(unittest.TestCase):
         )
         self.assertEqual(control.Barcode, "BC-9")
 
-    def test_schema_overrides_redirect_a_field_to_another_schema_id(self):
-        fields, rows = parse_export(load_sample(), ANNOTATION_ID)
-        einvoice, _, _ = map_document(
-            fields,
-            rows,
-            annotation_id=ANNOTATION_ID,
-            today="2024-01-01",
-            overrides={"CustormerID": "sender_name"},
-        )
-        self.assertEqual(einvoice.CustormerID, "Acme Components s.r.o.")
+    def test_fields_without_a_schema_id_stay_empty(self):
+        """Discount and the routing addresses have no Rossum source."""
+        _, control, lines = self.map_sample()
+
+        self.assertEqual(control.EmailTo, "")
+        self.assertEqual(control.EmailFrom, "")
+        self.assertEqual(lines[0].Discount, "")
 
     def test_missing_fields_map_to_empty_strings_not_errors(self):
         einvoice, control, lines = map_document(
@@ -372,25 +368,15 @@ class ReadConfigTests(unittest.TestCase):
     def test_annotation_id_can_come_from_a_nested_annotation_object(self):
         payload = base_payload()
         del payload["annotationId"]
-        payload["annotation"] = {
-            "id": 555,
-            "queue": "https://example.rossum.app/api/v1/queues/42",
-        }
+        payload["annotation"] = {"id": 555}
         config = read_config(payload)
 
         self.assertEqual(config.annotation_id, "555")
-        self.assertEqual(config.queue_url, "https://example.rossum.app/api/v1/queues/42")
 
     def test_a_non_http_sink_is_rejected_before_any_api_call(self):
         for bad in ("file:///etc/passwd", "ftp://host/x", "not-a-url", "https://"):
             with self.assertRaises(ValueError, msg=bad):
                 read_config(base_payload(postbin_url=bad))
-
-    def test_schema_overrides_must_be_an_object(self):
-        payload = base_payload()
-        payload["settings"]["schema_overrides"] = ["nope"]
-        with self.assertRaises(ValueError):
-            read_config(payload)
 
     def test_token_is_kept_out_of_the_repr(self):
         config = read_config(base_payload())
@@ -398,49 +384,20 @@ class ReadConfigTests(unittest.TestCase):
 
 
 class ResolveQueueTests(unittest.TestCase):
-    def make_config(self, **kwargs):
-        defaults = dict(
-            token="t",
-            base_url="https://example.rossum.app",
-            annotation_id=ANNOTATION_ID,
-            sink_url="https://www.postb.in/BIN",
-        )
-        defaults.update(kwargs)
-        return Config(**defaults)
-
-    def test_the_annotations_own_queue_outranks_a_static_setting(self):
-        """A stale settings.queue_id must not export against the wrong queue."""
-        config = self.make_config(
-            queue_url="https://example.rossum.app/api/v1/queues/999", queue_id="111"
-        )
-        api = mock.Mock(spec=function.RossumAPI)
-
-        self.assertEqual(resolve_queue_id(config, api), "999")
-        api.queue_url_of.assert_not_called()
-
-    def test_falls_back_to_the_setting_without_an_extra_api_call(self):
-        config = self.make_config(queue_id="111")
-        api = mock.Mock(spec=function.RossumAPI)
-
-        self.assertEqual(resolve_queue_id(config, api), "111")
-        api.queue_url_of.assert_not_called()
-
-    def test_looks_the_queue_up_when_nothing_is_known(self):
-        config = self.make_config()
+    def test_the_queue_id_is_the_last_segment_of_the_looked_up_url(self):
         api = mock.Mock(spec=function.RossumAPI)
         api.queue_url_of.return_value = "https://example.rossum.app/api/v1/queues/77/"
 
-        self.assertEqual(resolve_queue_id(config, api), "77")
+        self.assertEqual(resolve_queue_id(ANNOTATION_ID, api), "77")
         api.queue_url_of.assert_called_once_with(ANNOTATION_ID)
 
     def test_an_unusable_queue_url_is_a_clear_error(self):
-        config = self.make_config()
         api = mock.Mock(spec=function.RossumAPI)
         api.queue_url_of.return_value = ""
 
         with self.assertRaises(ValueError) as caught:
-            resolve_queue_id(config, api)
-        self.assertIn("settings.queue_id", str(caught.exception))
+            resolve_queue_id(ANNOTATION_ID, api)
+        self.assertIn(ANNOTATION_ID, str(caught.exception))
 
 
 class HandlerTests(unittest.TestCase):
@@ -456,6 +413,15 @@ class HandlerTests(unittest.TestCase):
         patcher = mock.patch.object(function, "post_to_sink", side_effect=record)
         self.post = patcher.start()
         self.addCleanup(patcher.stop)
+
+        # The queue is always looked up; give every handler test one to find.
+        lookup = mock.patch.object(
+            function.RossumAPI,
+            "queue_url_of",
+            return_value="https://example.rossum.app/api/v1/queues/87654321",
+        )
+        self.queue_url_of = lookup.start()
+        self.addCleanup(lookup.stop)
 
     def patch_api(self, export=None, side_effect=None):
         api = mock.patch.object(
@@ -473,13 +439,15 @@ class HandlerTests(unittest.TestCase):
         return result["messages"][0]
 
     def test_happy_path_posts_the_expected_envelope(self):
-        self.patch_api(export=load_sample())
+        export = self.patch_api(export=load_sample())
         payload = base_payload()
-        payload["settings"]["queue_id"] = "87654321"
 
         message = self.only_message(rossum_hook_request_handler(payload))
 
         self.assertEqual(message["type"], "info")
+        # The queue always comes from the annotation lookup, never from settings.
+        self.queue_url_of.assert_called_once_with(ANNOTATION_ID)
+        export.assert_called_once_with("87654321", ANNOTATION_ID)
         url, body = self.posted[0]
         self.assertEqual(url, "https://www.postb.in/BIN")
         self.assertEqual(set(body), {"annotationId", "content"})
@@ -494,7 +462,6 @@ class HandlerTests(unittest.TestCase):
     def test_content_is_base64_of_the_utf8_xml_bytes(self):
         self.patch_api(export=load_sample())
         payload = base_payload()
-        payload["settings"]["queue_id"] = "87654321"
 
         rossum_hook_request_handler(payload)
         _, body = self.posted[0]
@@ -504,12 +471,11 @@ class HandlerTests(unittest.TestCase):
     def test_an_export_with_no_datapoints_warns_instead_of_reporting_success(self):
         self.patch_api(export=export_with([]))
         payload = base_payload()
-        payload["settings"]["queue_id"] = "87654321"
 
         message = self.only_message(rossum_hook_request_handler(payload))
 
         self.assertEqual(message["type"], "warning")
-        self.assertIn("schema_overrides", message["content"])
+        self.assertIn("No datapoints were extracted", message["content"])
 
     def test_a_missing_field_fails_before_any_network_call(self):
         export = self.patch_api(export=load_sample())
@@ -517,6 +483,7 @@ class HandlerTests(unittest.TestCase):
         message = self.only_message(rossum_hook_request_handler({}))
 
         self.assertEqual(message["type"], "error")
+        self.queue_url_of.assert_not_called()
         export.assert_not_called()
         self.assertEqual(self.posted, [])
 
@@ -525,7 +492,6 @@ class HandlerTests(unittest.TestCase):
         response.text = "not found"
         self.patch_api(side_effect=requests.HTTPError(response=response))
         payload = base_payload()
-        payload["settings"]["queue_id"] = "1"
 
         message = self.only_message(rossum_hook_request_handler(payload))
 
@@ -537,7 +503,6 @@ class HandlerTests(unittest.TestCase):
         """exc.response is None for some failures; reading it must not escape."""
         self.patch_api(side_effect=requests.HTTPError("boom"))
         payload = base_payload()
-        payload["settings"]["queue_id"] = "1"
 
         message = self.only_message(rossum_hook_request_handler(payload))
 
@@ -549,7 +514,6 @@ class HandlerTests(unittest.TestCase):
         request = mock.Mock(url="https://www.postb.in/BIN")
         self.patch_api(side_effect=requests.ConnectTimeout("refused", request=request))
         payload = base_payload()
-        payload["settings"]["queue_id"] = "1"
 
         message = self.only_message(rossum_hook_request_handler(payload))
 
@@ -561,7 +525,6 @@ class HandlerTests(unittest.TestCase):
         request = mock.Mock(url="https://example.rossum.app/api/v1/queues/1/export")
         self.patch_api(side_effect=requests.ReadTimeout("slow", request=request))
         payload = base_payload()
-        payload["settings"]["queue_id"] = "1"
 
         message = self.only_message(rossum_hook_request_handler(payload))
 
@@ -571,7 +534,6 @@ class HandlerTests(unittest.TestCase):
     def test_an_unexpected_error_is_still_reported_as_a_message(self):
         self.patch_api(side_effect=RuntimeError("kaboom"))
         payload = base_payload()
-        payload["settings"]["queue_id"] = "1"
 
         message = self.only_message(rossum_hook_request_handler(payload))
 
@@ -584,7 +546,6 @@ class HandlerTests(unittest.TestCase):
             response=mock.Mock(status_code=500, url="https://www.postb.in/BIN", text="down")
         )
         payload = base_payload()
-        payload["settings"]["queue_id"] = "87654321"
 
         message = self.only_message(rossum_hook_request_handler(payload))
 

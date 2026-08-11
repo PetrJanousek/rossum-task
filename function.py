@@ -19,8 +19,7 @@ Field mapping
 -------------
 Each XML element is declared exactly once: as a dataclass field whose name is
 the tag, whose position is the document order, and whose metadata names the one
-Rossum schema_id it reads. Nothing is guessed from a list of candidate aliases;
-a queue with a customised schema supplies `settings.schema_overrides` instead.
+Rossum schema_id it reads. Nothing is guessed from a list of candidate aliases.
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ import requests
 API_PREFIX = "/api/v1"  # payload base_url is the org origin, without this
 # At most 3 sequential calls against the hook's hard 30s ceiling, leaving room
 # to return an error instead of being killed. Note this bounds each socket
-# operation, not total wall clock, which is why redirects are refused below.
+# operation, not total wall clock.
 REQUEST_TIMEOUT = 8.0
 LINE_ITEMS_ID = "line_items"
 TAX_DETAILS_ID = "tax_details"
@@ -86,7 +85,7 @@ class Control:
     CurrentDate: str = _src()
     Barcode: str = _src()
     # Routing addresses live on the payload's email object, not in extracted
-    # content, so these stay empty unless pointed at a field by an override.
+    # content, so these stay empty.
     EmailTo: str = _src()
     EmailFrom: str = _src()
 
@@ -100,7 +99,7 @@ class Line:
     # "Unit Price"; item_amount_base is the excl.-tax variant. Paired with
     # TotalPrice below so both sides of the line are on the same tax basis.
     UnitPrice: str = _src("item_amount")
-    Discount: str = _src()  # no standard Rossum field; override-only
+    Discount: str = _src()  # no standard Rossum field; left empty
     TaxRate: str = _src("item_rate")
     TaxAmount: str = _src("item_tax")
     TotalPrice: str = _src("item_amount_total")
@@ -112,9 +111,6 @@ class Config:
     base_url: str
     annotation_id: str
     sink_url: str
-    queue_id: str = ""
-    queue_url: str = ""
-    schema_overrides: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
 
 # --- parsing ---------------------------------------------------------------
@@ -214,11 +210,11 @@ def _is_zero_rate(text: str) -> bool:
         return False
 
 
-def _populate(cls: type, source: Mapping[str, str], overrides: Mapping[str, str]):
-    """Build a model, reading each field from its declared (or overridden) id."""
+def _populate(cls: type, source: Mapping[str, str]):
+    """Build a model, reading each field from its declared schema_id."""
     obj = cls()
     for fld in dataclasses.fields(cls):
-        schema_id = overrides.get(fld.name) or fld.metadata.get("schema_id", "")
+        schema_id = fld.metadata.get("schema_id", "")
         if schema_id:
             setattr(obj, fld.name, source.get(schema_id, ""))
     return obj
@@ -248,11 +244,9 @@ def map_document(
     *,
     annotation_id: str,
     today: str,
-    overrides: Mapping[str, str] | None = None,
 ) -> tuple[EInvoice, Control, list[Line]]:
     """Map parsed export data onto the FinancialDocDesc model."""
-    overrides = overrides or {}
-    einvoice: EInvoice = _populate(EInvoice, fields, overrides)
+    einvoice: EInvoice = _populate(EInvoice, fields)
 
     prefix = einvoice.VatID[:2]  # e.g. CZ12345678 -> CZ
     if len(prefix) == 2 and prefix.isalpha():
@@ -265,12 +259,12 @@ def map_document(
         einvoice.NetAmount1 = fields.get("amount_total_base", "")
         einvoice.TaxAmount1 = fields.get("amount_total_tax", "")
 
-    control: Control = _populate(Control, fields, overrides)
+    control: Control = _populate(Control, fields)
     control.Origin = "EMAIL"
     control.CurrentDate = today
     control.Barcode = fields.get("barcode") or annotation_id
 
-    lines = [_populate(Line, row, overrides) for row in rows.get(LINE_ITEMS_ID, [])]
+    lines = [_populate(Line, row) for row in rows.get(LINE_ITEMS_ID, [])]
     return einvoice, control, lines
 
 
@@ -281,7 +275,7 @@ def _append_fields(parent: ET.Element, model: Any) -> None:
     """Emit one element per declared field, stripping XML-illegal characters.
 
     Sanitizing here rather than at parse time means every value reaches the
-    document through this one gate, including derived and overridden ones.
+    document through this one gate, including derived ones.
     """
     for fld in dataclasses.fields(model):
         text = getattr(model, fld.name)
@@ -314,20 +308,10 @@ class RossumAPI:
         )
 
     def _get(self, path: str, **params: str) -> Any:
-        # No redirects: neither endpoint should redirect, and following one
-        # would both re-arm the timeout and forward the token to another host.
         response = self._session.get(
-            self._base + path,
-            params=params,
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=False,
+            self._base + path, params=params, timeout=REQUEST_TIMEOUT
         )
         response.raise_for_status()
-        if response.is_redirect:
-            raise ValueError(
-                f"{response.url} redirected to "
-                f"{response.headers.get('Location', 'elsewhere')}; check base_url."
-            )
         try:
             return response.json()
         except ValueError as exc:
@@ -366,7 +350,7 @@ def read_config(payload: Mapping[str, Any]) -> Config:
     annotation = annotation if isinstance(annotation, Mapping) else {}
 
     # invocation.manual merges the custom body at the top level; annotation
-    # events instead carry a nested annotation object with id and queue.
+    # events instead carry a nested annotation object with the id.
     annotation_id = payload.get("annotationId") or annotation.get("id")
     # A postbin_url in the invoke body overrides the stored setting, so a caller
     # can target a fresh bin per invocation without editing the hook.
@@ -393,39 +377,22 @@ def read_config(payload: Mapping[str, Any]) -> Config:
             f"postbin_url must be an http(s) URL with a host, got {sink!r}."
         )
 
-    overrides = settings.get("schema_overrides") or {}
-    if not isinstance(overrides, Mapping):
-        raise ValueError("settings.schema_overrides must be an object of field: schema_id.")
-
     return Config(
         token=str(payload["rossum_authorization_token"]),
         base_url=str(payload["base_url"]),
         annotation_id=str(annotation_id),
         sink_url=sink,
-        queue_id=str(settings.get("queue_id") or ""),
-        queue_url=str(annotation.get("queue") or ""),
-        schema_overrides=overrides,
     )
 
 
-def resolve_queue_id(config: Config, api: RossumAPI) -> str:
-    """
-    Prefer the queue the annotation actually belongs to.
-
-    A static settings.queue_id is only a fallback: on a hook wired to several
-    queues a stale value would export against the wrong one and report the
-    annotation as unexportable, which reads as a data problem, not config.
-    """
-    if config.queue_url:
-        queue_url = config.queue_url
-    elif config.queue_id:
-        return config.queue_id
-    else:
-        queue_url = api.queue_url_of(config.annotation_id)
+def resolve_queue_id(annotation_id: str, api: RossumAPI) -> str:
+    """Ask the API which queue the annotation belongs to, and take its id."""
+    queue_url = api.queue_url_of(annotation_id)
     queue_id = urlparse(queue_url).path.rstrip("/").rsplit("/", 1)[-1]
     if not queue_id:
         raise ValueError(
-            "Could not determine the queue for this annotation; set settings.queue_id."
+            f"Could not determine the queue for annotation {annotation_id}; "
+            f"the API returned {queue_url!r}."
         )
     return queue_id
 
@@ -436,7 +403,7 @@ def rossum_hook_request_handler(payload: dict) -> dict:
         config = read_config(payload)
         api = RossumAPI(config.base_url, config.token)
 
-        queue_id = resolve_queue_id(config, api)
+        queue_id = resolve_queue_id(config.annotation_id, api)
         fields, rows = parse_export(
             api.export(queue_id, config.annotation_id), config.annotation_id
         )
@@ -446,7 +413,6 @@ def rossum_hook_request_handler(payload: dict) -> dict:
                 rows,
                 annotation_id=config.annotation_id,
                 today=datetime.now(timezone.utc).date().isoformat(),
-                overrides=config.schema_overrides,
             )
         )
         status = post_to_sink(
@@ -465,7 +431,7 @@ def rossum_hook_request_handler(payload: dict) -> dict:
             # Valid but empty XML was delivered; say so rather than report success.
             return _message(
                 "warning", f"{summary} No datapoints were extracted - check the "
-                "annotation's schema ids against settings.schema_overrides."
+                "annotation's schema ids against the ones this hook declares."
             )
         return _message("info", summary)
     except ValueError as exc:
