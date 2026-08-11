@@ -1,0 +1,340 @@
+{
+  "pagination": {
+    "total": 1,
+    "next": null,
+    "previous": null
+  },
+  "results": [
+    {
+      "url": "https://example.rossum.app/api/v1/annotations/12345678",
+      "status": "confirmed",
+      "queue": "https://example.rossum.app/api/v1/queues/87654321",
+      "content": [
+        {
+          "category": "section",
+          "schema_id": "invoice_details_section",
+          "children": [
+            {
+              "category": "datapoint",
+              "schema_id": "document_type",
+              "type": "enum",
+              "value": "tax_invoice"
+            },
+            {
+              "category": "datapoint",
+              "schema_id": "document_id",
+              "type": "string",
+              "value": "INV-2024-0042"
+            },
+            {
+              "category": "datapoint",
+              "schema_id": "order_id",
+              "type": "string",
+              "value": "PO-77123"
+            },
+            {
+              "category": "datapoint",
+              "schema_id": "date_issue",
+              "type": "date",
+              "value": "2024-05-14"
+            },
+            {
+              "category": "datapoint",
+              "schema_id": "date_due",
+              "type": "date",
+              "value": "2024-06-13"
+            },
+            {
+              "category": "datapoint",
+              "schema_id": "currency",
+              "type": "enum",
+              "value": "czk"
+            },
+            {
+              "category": "datapoint",
+              "schema_id": "amount_total",
+              "type": "number",
+              "value": "332.50"
+            },
+            {
+              "category": "datapoint",
+              "schema_id": "amount_total_base",
+              "type": "number",
+              "value": "280.00"
+            },
+            {
+              "category": "datapoint",
+              "schema_id": "amount_total_tax",
+              "type": "number",
+              "value": "52.50"
+            },
+            {
+              "category": "datapoint",
+              "schema_id": "vat_exemption_reason_code",
+              "type": "string",
+              "value": ""
+            }
+          ]
+        },
+        {
+          "category": "section",
+          "schema_id": "vendor_section",
+          "children": [
+            {
+              "category": "datapoint",
+              "schema_id": "sender_name",
+              "type": "string",
+              "value": "Acme Components s.r.o."
+            },
+            {
+              "category": "datapoint",
+              "schema_id": "sender_vat_id",
+              "type": "string",
+              "value": "CZ12345678"
+            },
+            {
+              "category": "datapoint",
+              "schema_id": "recipient_ic",
+              "type": "string",
+              "value": "87654321"
+            }
+          ]
+        },
+        {
+          "category": "section",
+          "schema_id": "amounts_section",
+          "children": [
+            {
+              "category": "multivalue",
+              "schema_id": "tax_details",
+              "children": [
+                {
+                  "category": "tuple",
+                  "schema_id": "tax_detail",
+                  "children": [
+                    {
+                      "category": "datapoint",
+                      "schema_id": "tax_detail_rate",
+                      "type": "number",
+                      "value": "21"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "tax_detail_base",
+                      "type": "number",
+                      "value": "250.00"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "tax_detail_tax",
+                      "type": "number",
+                      "value": "52.50"
+                    }
+                  ]
+                },
+                {
+                  "category": "tuple",
+                  "schema_id": "tax_detail",
+                  "children": [
+                    {
+                      "category": "datapoint",
+                      "schema_id": "tax_detail_rate",
+                      "type": "number",
+                      "value": "0"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "tax_detail_base",
+                      "type": "number",
+                      "value": "30.00"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "tax_detail_tax",
+                      "type": "number",
+                      "value": "0.00"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "category": "section",
+          "schema_id": "line_items_section",
+          "children": [
+            {
+              "category": "multivalue",
+              "schema_id": "line_items",
+              "children": [
+                {
+                  "category": "tuple",
+                  "schema_id": "line_item",
+                  "children": [
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_code",
+                      "type": "string",
+                      "value": "ACM-1001"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_description",
+                      "type": "string",
+                      "value": "Hex bolt M8x40, zinc plated"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_quantity",
+                      "type": "number",
+                      "value": "2"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_uom",
+                      "type": "string",
+                      "value": "pcs"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_amount",
+                      "type": "number",
+                      "value": "100.00"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_rate",
+                      "type": "number",
+                      "value": "21"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_tax",
+                      "type": "number",
+                      "value": "42.00"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_amount_total",
+                      "type": "number",
+                      "value": "200.00"
+                    }
+                  ]
+                },
+                {
+                  "category": "tuple",
+                  "schema_id": "line_item",
+                  "children": [
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_code",
+                      "type": "string",
+                      "value": "ACM-2002"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_description",
+                      "type": "string",
+                      "value": "Washer, 8mm"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_quantity",
+                      "type": "number",
+                      "value": "1"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_uom",
+                      "type": "string",
+                      "value": "pcs"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_amount",
+                      "type": "number",
+                      "value": "50.00"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_rate",
+                      "type": "number",
+                      "value": "21"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_tax",
+                      "type": "number",
+                      "value": "10.50"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_amount_total",
+                      "type": "number",
+                      "value": "50.00"
+                    }
+                  ]
+                },
+                {
+                  "category": "tuple",
+                  "schema_id": "line_item",
+                  "children": [
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_code",
+                      "type": "string",
+                      "value": "ACM-3003"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_description",
+                      "type": "string",
+                      "value": "Printed manual (zero-rated)"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_quantity",
+                      "type": "number",
+                      "value": "1"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_uom",
+                      "type": "string",
+                      "value": "pcs"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_amount",
+                      "type": "number",
+                      "value": "30.00"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_rate",
+                      "type": "number",
+                      "value": "0"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_tax",
+                      "type": "number",
+                      "value": "0.00"
+                    },
+                    {
+                      "category": "datapoint",
+                      "schema_id": "item_amount_total",
+                      "type": "number",
+                      "value": "30.00"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

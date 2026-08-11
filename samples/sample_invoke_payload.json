@@ -1,0 +1,9 @@
+{
+  "rossum_authorization_token": "REPLACE_WITH_A_REAL_TOKEN",
+  "base_url": "https://example.rossum.app",
+  "annotationId": "12345678",
+  "settings": {
+    "postbin_url": "https://www.postb.in/REPLACE_WITH_A_REAL_BIN_ID",
+    "queue_id": "87654321"
+  }
+}

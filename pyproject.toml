@@ -1,0 +1,17 @@
+[project]
+name = "rossum-postbin-export-hook"
+version = "1.0.0"
+description = "Rossum serverless hook: export an annotation as FinancialDocDesc XML and POST it base64-encoded to PostBin"
+readme = "README.md"
+requires-python = ">=3.9"
+# The function itself needs only the stdlib plus `requests`, which Rossum's
+# runtime provides in its default third-party library pack. Nothing to install
+# for deployment; `requests` is needed locally to run the tests.
+dependencies = ["requests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+# Preferred: python -m unittest discover -s tests -v
+# Optional:  python -m pytest tests -v
