@@ -3,18 +3,6 @@ Rossum serverless hook: export an annotation, map it to FinancialDocDesc XML,
 and POST it to a sink (PostBin) as base64 inside a JSON envelope.
 
 Entry point: rossum_hook_request_handler(payload) -> {"messages": [...]}
-
-Runtime notes
--------------
-* Rossum's python3.12 runtime ships a default third-party library pack that
-  includes `requests` and `jmespath`, so we use them instead of hand-rolling
-  urllib and a recursive tree walk. The hook's `third_party_library_pack` must
-  be "default" (which it is unless changed).
-* Outbound internet is disabled by default for Rossum functions. The calls to
-  the Rossum API work out of the box; the POST to an external sink requires
-  egress to be enabled for the organization (contact product@rossum.ai).
-* POST /v1/hooks/{id}/invoke forces a 30s wall clock that cannot be raised, and
-  the injected token is valid for 10 minutes, so every request is short-timed.
 """
 
 import base64
@@ -27,19 +15,14 @@ from typing import Any
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
-import jmespath
 import requests
 
-# Both endpoints are fixed on purpose: the hook only ever talks to this org's
-# Rossum API and to postb.in, so a caller cannot point it anywhere else. Only
-# the annotation id and the bin id vary per invocation.
 ROSSUM_BASE_URL = "https://foobar.rossum.app"
 POSTBIN_ORIGIN = "https://www.postb.in"
 # At most 2 sequential calls (export + sink) against the hook's hard 30s
 # ceiling, leaving room to return an error instead of being killed. Note this
 # bounds each socket operation, not total wall clock.
 REQUEST_TIMEOUT = 8.0
-TAX_BUCKETS = 3  # the target schema exposes Net/Tax/Rate 1..3
 
 # XML 1.0 forbids most control characters; OCR output occasionally contains one.
 # Strip them rather than fail serialization on an otherwise valid document.
@@ -47,7 +30,6 @@ _ILLEGAL_XML = re.compile("[^\x09\x0a\x0d\x20-퟿-�\U00010000-\U0010ffff]")
 
 
 def _src(schema_id: str = "") -> Any:
-    """Declare an element sourced from `schema_id`; "" means derived in code."""
     return field(default="", metadata={"schema_id": schema_id})
 
 
@@ -78,13 +60,11 @@ class EInvoice:
 
 @dataclass
 class Control:
-    Origin: str = _src()
-    CurrentDate: str = _src()
-    Barcode: str = _src()
-    # Routing addresses live on the payload's email object, not in extracted
-    # content, so these stay empty.
-    EmailTo: str = _src()
-    EmailFrom: str = _src()
+    Origin: str = ""
+    CurrentDate: str = ""
+    Barcode: str = ""
+    EmailTo: str = ""
+    EmailFrom: str = ""
 
 
 @dataclass
@@ -93,8 +73,6 @@ class Line:
     Description: str = _src("item_description")
     Quantity: str = _src("item_quantity")
     UnitMeasure: str = _src("item_uom")
-    # "Unit Price"; item_amount_base is the excl.-tax variant. Paired with
-    # TotalPrice below so both sides of the line are on the same tax basis.
     UnitPrice: str = _src("item_amount")
     Discount: str = _src()  # no standard Rossum field; left empty
     TaxRate: str = _src("item_rate")
@@ -113,28 +91,15 @@ class Config:
 
 
 def _text(value: Any) -> str:
-    """Render a datapoint value as text, exactly as extracted.
-
-    No reformatting: rewriting 42.0 to "42" would be inventing a number's
-    format, which is the one thing this mapper promises not to do.
-    """
+    """Render a datapoint value as text, exactly as extracted."""
     return "" if value is None else str(value).strip()
 
 
-# Rossum's content tree is sections at the top with datapoints and multivalues
-# one level below (the tests also place them at the top level directly), so the
-# node stream is a union of both depths: every top-level node, then every child.
-# jmespath has no recursive descent — anything nested deeper would be dropped.
-# The `|` stops the flatten projection so the filter sees the whole node list.
-_NODES = "[content, content[].children[]][] | "
-_FIELDS_QUERY = jmespath.compile(_NODES + "[?category=='datapoint']")
-# For each multivalue: its schema_id and one datapoint-list per tuple row.
-# `[?...][]` turns the filter projection into a plain list so the next step
-# maps tuple -> children instead of flattening every row into one.
-_ROWS_QUERY = jmespath.compile(
-    _NODES + "[?category=='multivalue'].{id: schema_id,"
-    " tuples: children[?category=='tuple'][].children[?category=='datapoint']}"
-)
+def _nodes(annotation: Mapping[str, Any]):
+    """Yield top-level content nodes, then their children (two levels)."""
+    for node in annotation.get("content") or []:
+        yield node
+        yield from node.get("children") or []
 
 
 def _first_non_empty(datapoints: Any) -> dict[str, str]:
@@ -158,16 +123,26 @@ def parse_export(
             "it is probably not in an exportable state yet."
         )
     annotation = results[0]
-    fields = _first_non_empty(_FIELDS_QUERY.search(annotation))
+    fields = _first_non_empty(
+        n for n in _nodes(annotation) if n.get("category") == "datapoint"
+    )
     rows: dict[str, list[dict[str, str]]] = {}
-    for multivalue in _ROWS_QUERY.search(annotation) or ():
-        collected = [
-            row
-            for row in map(_first_non_empty, multivalue["tuples"] or ())
-            if any(row.values())  # an all-blank row is noise, not data
-        ]
+    for node in _nodes(annotation):
+        if node.get("category") != "multivalue":
+            continue
+        collected = []
+        for child in node.get("children") or ():
+            if child.get("category") != "tuple":
+                continue
+            row = _first_non_empty(
+                n
+                for n in (child.get("children") or ())
+                if n.get("category") == "datapoint"
+            )
+            if any(row.values()):
+                collected.append(row)
         if collected:
-            rows.setdefault(multivalue["id"], []).extend(collected)
+            rows.setdefault(node.get("schema_id"), []).extend(collected)
     return fields, rows
 
 
@@ -195,26 +170,30 @@ def _populate(cls: type, source: Mapping[str, str]):
 
 def _apply_tax(einvoice: EInvoice, tax_rows: Sequence[Mapping[str, str]]) -> None:
     """Fill NetAmount0 (zero-rated) plus the NetAmount1..3 rate buckets."""
-    zero_rated: list[tuple[str, str, str]] = []
     rated: list[tuple[str, str, str]] = []
     for row in tax_rows:
         rate = row.get("tax_detail_rate", "")
-        base, tax = row.get("tax_detail_base", ""), row.get("tax_detail_tax", "")
+        base = row.get("tax_detail_base", "")
+        tax = row.get("tax_detail_tax", "")
         if not (base or tax):
-            continue  # an all-blank row must not consume a bucket
-        (zero_rated if _is_zero_rate(rate) else rated).append((rate, base, tax))
-    if zero_rated:
-        einvoice.NetAmount0 = zero_rated[0][1]
-    for index, (rate, base, tax) in enumerate(rated[:TAX_BUCKETS], start=1):
-        setattr(einvoice, f"NetAmount{index}", base)
-        setattr(einvoice, f"TaxAmount{index}", tax)
-        setattr(einvoice, f"TaxRate{index}", rate)
+            continue
+        if _is_zero_rate(rate):
+            if not einvoice.NetAmount0:
+                einvoice.NetAmount0 = base
+            continue
+        rated.append((base, tax, rate))
+
+    if rated:
+        einvoice.NetAmount1, einvoice.TaxAmount1, einvoice.TaxRate1 = rated[0]
+    if len(rated) > 1:
+        einvoice.NetAmount2, einvoice.TaxAmount2, einvoice.TaxRate2 = rated[1]
+    if len(rated) > 2:
+        einvoice.NetAmount3, einvoice.TaxAmount3, einvoice.TaxRate3 = rated[2]
 
 
 def map_document(
     fields: Mapping[str, str],
     rows: Mapping[str, list[dict[str, str]]],
-    *,
     annotation_id: str,
     today: str,
 ) -> tuple[EInvoice, Control, list[Line]]:
@@ -231,7 +210,7 @@ def map_document(
         einvoice.NetAmount1 = fields.get("amount_total_base", "")
         einvoice.TaxAmount1 = fields.get("amount_total_tax", "")
 
-    control = Control()  # every Control element is derived, none is extracted
+    control = Control()
     control.Origin = "EMAIL"
     control.CurrentDate = today
     control.Barcode = fields.get("barcode") or annotation_id
@@ -244,11 +223,7 @@ def map_document(
 
 
 def _append_fields(parent: ET.Element, model: Any) -> None:
-    """Emit one element per declared field, stripping XML-illegal characters.
-
-    Sanitizing here rather than at parse time means every value reaches the
-    document through this one gate, including derived ones.
-    """
+    """Emit one element per declared field, stripping XML-illegal characters."""
     for fld in dataclasses.fields(model):
         text = getattr(model, fld.name)
         ET.SubElement(parent, fld.name).text = _ILLEGAL_XML.sub("", text)
@@ -318,14 +293,19 @@ def rossum_hook_request_handler(payload: dict) -> dict:
             export_annotation(config.token, config.annotation_id),
             config.annotation_id,
         )
-        xml = to_xml(
-            *map_document(
-                fields,
-                rows,
-                annotation_id=config.annotation_id,
-                today=datetime.now(timezone.utc).date().isoformat(),
+        if not fields and not rows:
+            return _message(
+                "warning",
+                f"Annotation {config.annotation_id}: no datapoints were extracted - "
+                "check the annotation's schema ids against the ones this hook declares.",
             )
+        einvoice, control, lines = map_document(
+            fields,
+            rows,
+            annotation_id=config.annotation_id,
+            today=datetime.now(timezone.utc).date().isoformat(),
         )
+        xml = to_xml(einvoice, control, lines)
         status = post_to_sink(
             config.sink_url,
             {
@@ -333,24 +313,16 @@ def rossum_hook_request_handler(payload: dict) -> dict:
                 "content": base64.b64encode(xml).decode("ascii"),
             },
         )
-        summary = (
+        return _message(
+            "info",
             f"Annotation {config.annotation_id}: mapped "
             f"{len(fields)} field(s) and {len(rows.get('line_items', []))} line "
-            f"item(s) to FinancialDocDesc, posted {len(xml)} bytes (HTTP {status})."
+            f"item(s) to FinancialDocDesc, posted {len(xml)} bytes (HTTP {status}).",
         )
-        if not fields:
-            # Valid but empty XML was delivered; say so rather than report success.
-            return _message(
-                "warning", f"{summary} No datapoints were extracted - check the "
-                "annotation's schema ids against the ones this hook declares."
-            )
-        return _message("info", summary)
     except ValueError as exc:
         return _message("error", str(exc))
     except requests.HTTPError as exc:
-        response = exc.response  # None unless raise_for_status() raised this
-        if response is None:
-            return _message("error", f"HTTP error: {exc}")
+        response = exc.response
         body = response.text[:300] or exc
         return _message("error", f"HTTP {response.status_code} from {response.url}: {body}")
     except requests.ConnectionError as exc:

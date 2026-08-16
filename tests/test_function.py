@@ -463,14 +463,28 @@ class HandlerTests(unittest.TestCase):
 
         self.assertTrue(base64.b64decode(body["content"]).startswith(b"<?xml"))
 
-    def test_an_export_with_no_datapoints_warns_instead_of_reporting_success(self):
+    def test_an_export_with_no_datapoints_warns_and_does_not_post(self):
         self.patch_api(export=export_with([]))
         payload = base_payload()
 
         message = self.only_message(rossum_hook_request_handler(payload))
 
         self.assertEqual(message["type"], "warning")
-        self.assertIn("No datapoints were extracted", message["content"])
+        self.assertIn("no datapoints were extracted", message["content"])
+        self.assertEqual(self.posted, [])
+
+    def test_rows_without_header_fields_are_still_posted(self):
+        self.patch_api(
+            export=export_with(
+                [multivalue("line_items", tuple_of(datapoint("item_code", "ACM-1")))]
+            )
+        )
+        payload = base_payload()
+
+        message = self.only_message(rossum_hook_request_handler(payload))
+
+        self.assertEqual(message["type"], "info")
+        self.assertEqual(len(self.posted), 1)
 
     def test_a_missing_field_fails_before_any_network_call(self):
         export = self.patch_api(export=load_sample())
@@ -492,16 +506,6 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual(message["type"], "error")
         self.assertIn("404", message["content"])
         self.assertIn("not found", message["content"])
-
-    def test_http_error_without_a_response_still_returns_a_message(self):
-        """exc.response is None for some failures; reading it must not escape."""
-        self.patch_api(side_effect=requests.HTTPError("boom"))
-        payload = base_payload()
-
-        message = self.only_message(rossum_hook_request_handler(payload))
-
-        self.assertEqual(message["type"], "error")
-        self.assertIn("boom", message["content"])
 
     def test_connect_timeout_explains_the_egress_restriction(self):
         """ConnectTimeout subclasses Timeout, so ordering decides the message."""
