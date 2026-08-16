@@ -7,41 +7,38 @@ Entry point: rossum_hook_request_handler(payload) -> {"messages": [...]}
 Runtime notes
 -------------
 * Rossum's python3.12 runtime ships a default third-party library pack that
-  includes `requests`, so we use it instead of hand-rolling urllib. The hook's
-  `third_party_library_pack` must be "default" (which it is unless changed).
+  includes `requests` and `jmespath`, so we use them instead of hand-rolling
+  urllib and a recursive tree walk. The hook's `third_party_library_pack` must
+  be "default" (which it is unless changed).
 * Outbound internet is disabled by default for Rossum functions. The calls to
   the Rossum API work out of the box; the POST to an external sink requires
   egress to be enabled for the organization (contact product@rossum.ai).
 * POST /v1/hooks/{id}/invoke forces a 30s wall clock that cannot be raised, and
   the injected token is valid for 10 minutes, so every request is short-timed.
-
-Field mapping
--------------
-Each XML element is declared exactly once: as a dataclass field whose name is
-the tag, whose position is the document order, and whose metadata names the one
-Rossum schema_id it reads. Nothing is guessed from a list of candidate aliases.
 """
-
-from __future__ import annotations
 
 import base64
 import dataclasses
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
+import jmespath
 import requests
 
-API_PREFIX = "/api/v1"  # payload base_url is the org origin, without this
-# At most 3 sequential calls against the hook's hard 30s ceiling, leaving room
-# to return an error instead of being killed. Note this bounds each socket
-# operation, not total wall clock.
+# Both endpoints are fixed on purpose: the hook only ever talks to this org's
+# Rossum API and to postb.in, so a caller cannot point it anywhere else. Only
+# the annotation id and the bin id vary per invocation.
+ROSSUM_BASE_URL = "https://foobar.rossum.app"
+POSTBIN_ORIGIN = "https://www.postb.in"
+# At most 2 sequential calls (export + sink) against the hook's hard 30s
+# ceiling, leaving room to return an error instead of being killed. Note this
+# bounds each socket operation, not total wall clock.
 REQUEST_TIMEOUT = 8.0
-LINE_ITEMS_ID = "line_items"
-TAX_DETAILS_ID = "tax_details"
 TAX_BUCKETS = 3  # the target schema exposes Net/Tax/Rate 1..3
 
 # XML 1.0 forbids most control characters; OCR output occasionally contains one.
@@ -108,7 +105,6 @@ class Line:
 @dataclass
 class Config:
     token: str = field(repr=False)  # keep the token out of tracebacks and logs
-    base_url: str
     annotation_id: str
     sink_url: str
 
@@ -117,62 +113,38 @@ class Config:
 
 
 def _text(value: Any) -> str:
-    """Render a datapoint value as XML-safe text; never invent a number."""
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, float) and value.is_integer():
-        value = int(value)
-    return str(value).strip()
+    """Render a datapoint value as text, exactly as extracted.
 
-
-def _keep_first(target: dict[str, str], schema_id: str, value: str) -> None:
-    """First non-empty value for a schema_id wins — the rule everywhere here."""
-    if schema_id and not target.get(schema_id):
-        target[schema_id] = value
-
-
-def _row(node: Mapping[str, Any]) -> dict[str, str]:
-    """Flatten one tuple of datapoints; {} when every cell is blank."""
-    row: dict[str, str] = {}
-    for child in node.get("children") or ():
-        if isinstance(child, dict) and child.get("category") == "datapoint":
-            _keep_first(row, child.get("schema_id") or "", _text(child.get("value")))
-    return row if any(row.values()) else {}
-
-
-def _walk(
-    nodes: Any, fields: dict[str, str], rows: dict[str, list[dict[str, str]]]
-) -> None:
+    No reformatting: rewriting 42.0 to "42" would be inventing a number's
+    format, which is the one thing this mapper promises not to do.
     """
-    Split the content tree into header datapoints and multivalue row sets.
+    return "" if value is None else str(value).strip()
 
-    Rows are keyed by their multivalue's schema_id and collected structurally,
-    so a queue that names its rows something unexpected still yields rows —
-    and row data can never leak into the header.
-    """
-    for node in nodes if isinstance(nodes, list) else ():
-        if not isinstance(node, dict):
-            continue
-        category = node.get("category")
-        schema_id = node.get("schema_id") or ""
-        if category == "multivalue":
-            collected = [
-                row
-                for row in (
-                    _row(child)
-                    for child in node.get("children") or ()
-                    if isinstance(child, dict) and child.get("category") == "tuple"
-                )
-                if row
-            ]
-            if collected:
-                rows.setdefault(schema_id, []).extend(collected)
-        elif category == "datapoint":
-            _keep_first(fields, schema_id, _text(node.get("value")))
-        else:
-            _walk(node.get("children"), fields, rows)
+
+# Rossum's content tree is sections at the top with datapoints and multivalues
+# one level below (the tests also place them at the top level directly), so the
+# node stream is a union of both depths: every top-level node, then every child.
+# jmespath has no recursive descent — anything nested deeper would be dropped.
+# The `|` stops the flatten projection so the filter sees the whole node list.
+_NODES = "[content, content[].children[]][] | "
+_FIELDS_QUERY = jmespath.compile(_NODES + "[?category=='datapoint']")
+# For each multivalue: its schema_id and one datapoint-list per tuple row.
+# `[?...][]` turns the filter projection into a plain list so the next step
+# maps tuple -> children instead of flattening every row into one.
+_ROWS_QUERY = jmespath.compile(
+    _NODES + "[?category=='multivalue'].{id: schema_id,"
+    " tuples: children[?category=='tuple'][].children[?category=='datapoint']}"
+)
+
+
+def _first_non_empty(datapoints: Any) -> dict[str, str]:
+    """Flatten datapoint nodes; first non-empty value per schema_id wins."""
+    out: dict[str, str] = {}
+    for node in datapoints:
+        schema_id = node.get("schema_id")
+        if schema_id and not out.get(schema_id):
+            out[schema_id] = _text(node.get("value"))
+    return out
 
 
 def parse_export(
@@ -180,21 +152,22 @@ def parse_export(
 ) -> tuple[dict[str, str], dict[str, list[dict[str, str]]]]:
     """Validate the export envelope and split its content into fields + rows."""
     results = export.get("results")
-    if not isinstance(results, list) or not results:
+    if not results:
         raise ValueError(
             f"Export returned no results for annotation {annotation_id}; "
             "it is probably not in an exportable state yet."
         )
     annotation = results[0]
-    if not isinstance(annotation, Mapping):
-        raise ValueError(f"Export result is not an object: {annotation!r:.100}")
-    url = str(annotation.get("url", ""))
-    # Compare the id path segment, not a substring: "123" is in ".../1234".
-    if url and urlparse(url).path.rstrip("/").rsplit("/", 1)[-1] != annotation_id:
-        raise ValueError(f"Export returned {url!r}, expected annotation {annotation_id}.")
-    fields: dict[str, str] = {}
+    fields = _first_non_empty(_FIELDS_QUERY.search(annotation))
     rows: dict[str, list[dict[str, str]]] = {}
-    _walk(annotation.get("content"), fields, rows)
+    for multivalue in _ROWS_QUERY.search(annotation) or ():
+        collected = [
+            row
+            for row in map(_first_non_empty, multivalue["tuples"] or ())
+            if any(row.values())  # an all-blank row is noise, not data
+        ]
+        if collected:
+            rows.setdefault(multivalue["id"], []).extend(collected)
     return fields, rows
 
 
@@ -214,7 +187,7 @@ def _populate(cls: type, source: Mapping[str, str]):
     """Build a model, reading each field from its declared schema_id."""
     obj = cls()
     for fld in dataclasses.fields(cls):
-        schema_id = fld.metadata.get("schema_id", "")
+        schema_id = fld.metadata["schema_id"]
         if schema_id:
             setattr(obj, fld.name, source.get(schema_id, ""))
     return obj
@@ -245,26 +218,25 @@ def map_document(
     annotation_id: str,
     today: str,
 ) -> tuple[EInvoice, Control, list[Line]]:
-    """Map parsed export data onto the FinancialDocDesc model."""
     einvoice: EInvoice = _populate(EInvoice, fields)
 
     prefix = einvoice.VatID[:2]  # e.g. CZ12345678 -> CZ
     if len(prefix) == 2 and prefix.isalpha():
         einvoice.VatCountryCode = prefix.upper()
 
-    tax_rows = rows.get(TAX_DETAILS_ID, [])
+    tax_rows = rows.get("tax_details", [])
     if tax_rows:
         _apply_tax(einvoice, tax_rows)
     else:  # no per-rate breakdown extracted; fall back to the header totals
         einvoice.NetAmount1 = fields.get("amount_total_base", "")
         einvoice.TaxAmount1 = fields.get("amount_total_tax", "")
 
-    control: Control = _populate(Control, fields)
+    control = Control()  # every Control element is derived, none is extracted
     control.Origin = "EMAIL"
     control.CurrentDate = today
     control.Barcode = fields.get("barcode") or annotation_id
 
-    lines = [_populate(Line, row) for row in rows.get(LINE_ITEMS_ID, [])]
+    lines = [_populate(Line, row) for row in rows.get("line_items", [])]
     return einvoice, control, lines
 
 
@@ -297,37 +269,24 @@ def to_xml(einvoice: EInvoice, control: Control, lines: Sequence[Line]) -> bytes
 # --- I/O -------------------------------------------------------------------
 
 
-class RossumAPI:
-    """Thin authenticated client for the Rossum REST API."""
-
-    def __init__(self, base_url: str, token: str):
-        self._base = base_url.rstrip("/") + API_PREFIX
-        self._session = requests.Session()
-        self._session.headers.update(
-            {"Authorization": f"Bearer {token}", "User-Agent": "rossum-export-hook/1.0"}
-        )
-
-    def _get(self, path: str, **params: str) -> Any:
-        response = self._session.get(
-            self._base + path, params=params, timeout=REQUEST_TIMEOUT
-        )
-        response.raise_for_status()
-        try:
-            return response.json()
-        except ValueError as exc:
-            # Name the endpoint: a bare "Expecting value: line 1 column 1" tells
-            # an operator nothing about which call returned a non-JSON page.
-            raise ValueError(
-                f"{response.url} returned HTTP {response.status_code} but not "
-                f"JSON ({exc}). First bytes: {response.text[:200]!r}"
-            ) from exc
-
-    def queue_url_of(self, annotation_id: str) -> str:
-        return str(self._get(f"/annotations/{annotation_id}").get("queue", ""))
-
-    def export(self, queue_id: str, annotation_id: str) -> Any:
-        # No status filter: the export must work for any exportable annotation.
-        return self._get(f"/queues/{queue_id}/export", format="json", id=annotation_id)
+def export_annotation(token: str, annotation_id: str) -> Any:
+    response = requests.get(
+        f"{ROSSUM_BASE_URL}/api/v1/annotations/export",
+        params={"format": "json", "id": annotation_id},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "rossum-export-hook/1.0",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise ValueError(
+            f"{response.url} returned HTTP {response.status_code} but not "
+            f"JSON ({exc}). First bytes: {response.text[:200]!r}"
+        ) from exc
 
 
 def post_to_sink(url: str, body: Mapping[str, str]) -> int:
@@ -342,70 +301,22 @@ def post_to_sink(url: str, body: Mapping[str, str]) -> int:
 
 def read_config(payload: Mapping[str, Any]) -> Config:
     """Validate the payload up front so a failure names the missing field."""
-    if not isinstance(payload, Mapping):
-        raise ValueError("Payload must be a JSON object.")
-    settings = payload.get("settings")
-    settings = settings if isinstance(settings, Mapping) else {}
-    annotation = payload.get("annotation")
-    annotation = annotation if isinstance(annotation, Mapping) else {}
-
-    # invocation.manual merges the custom body at the top level; annotation
-    # events instead carry a nested annotation object with the id.
-    annotation_id = payload.get("annotationId") or annotation.get("id")
-    # A postbin_url in the invoke body overrides the stored setting, so a caller
-    # can target a fresh bin per invocation without editing the hook.
-    sink_url = payload.get("postbin_url") or settings.get("postbin_url")
-    missing = [
-        name
-        for name, value in (
-            ("rossum_authorization_token", payload.get("rossum_authorization_token")),
-            ("base_url", payload.get("base_url")),
-            ("annotationId", annotation_id),
-            ("postbin_url", sink_url),
-        )
-        if not value
-    ]
+    required = ("rossum_authorization_token", "annotationId", "postbin_id")
+    missing = [name for name in required if not payload.get(name)]
     if missing:
         raise ValueError(f"Missing required payload field(s): {', '.join(missing)}.")
 
-    # Validate the sink up front: otherwise a typo is only discovered after two
-    # API calls have already run, and the hook would POST invoice data anywhere.
-    sink = str(sink_url).strip()
-    parsed = urlparse(sink)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError(
-            f"postbin_url must be an http(s) URL with a host, got {sink!r}."
-        )
-
-    return Config(
-        token=str(payload["rossum_authorization_token"]),
-        base_url=str(payload["base_url"]),
-        annotation_id=str(annotation_id),
-        sink_url=sink,
-    )
-
-
-def resolve_queue_id(annotation_id: str, api: RossumAPI) -> str:
-    """Ask the API which queue the annotation belongs to, and take its id."""
-    queue_url = api.queue_url_of(annotation_id)
-    queue_id = urlparse(queue_url).path.rstrip("/").rsplit("/", 1)[-1]
-    if not queue_id:
-        raise ValueError(
-            f"Could not determine the queue for annotation {annotation_id}; "
-            f"the API returned {queue_url!r}."
-        )
-    return queue_id
+    token, annotation_id, bin_id = (str(payload[name]) for name in required)
+    return Config(token, annotation_id, f"{POSTBIN_ORIGIN}/{bin_id}")
 
 
 def rossum_hook_request_handler(payload: dict) -> dict:
     """Rossum hook entry point. Never raises; always returns hook messages."""
     try:
         config = read_config(payload)
-        api = RossumAPI(config.base_url, config.token)
-
-        queue_id = resolve_queue_id(config.annotation_id, api)
         fields, rows = parse_export(
-            api.export(queue_id, config.annotation_id), config.annotation_id
+            export_annotation(config.token, config.annotation_id),
+            config.annotation_id,
         )
         xml = to_xml(
             *map_document(
@@ -423,8 +334,8 @@ def rossum_hook_request_handler(payload: dict) -> dict:
             },
         )
         summary = (
-            f"Annotation {config.annotation_id} (queue {queue_id}): mapped "
-            f"{len(fields)} field(s) and {len(rows.get(LINE_ITEMS_ID, []))} line "
+            f"Annotation {config.annotation_id}: mapped "
+            f"{len(fields)} field(s) and {len(rows.get('line_items', []))} line "
             f"item(s) to FinancialDocDesc, posted {len(xml)} bytes (HTTP {status})."
         )
         if not fields:
@@ -437,17 +348,15 @@ def rossum_hook_request_handler(payload: dict) -> dict:
     except ValueError as exc:
         return _message("error", str(exc))
     except requests.HTTPError as exc:
-        # .response can be None, and an AttributeError raised in here would
-        # escape the handler entirely — read defensively.
-        response = exc.response
-        status = getattr(response, "status_code", "?")
-        url = getattr(response, "url", "unknown URL")
-        body = (getattr(response, "text", "") or "")[:300]
-        return _message("error", f"HTTP {status} from {url}: {body or exc}")
-    except (requests.ConnectTimeout, requests.ConnectionError) as exc:
-        # ConnectTimeout subclasses Timeout as well, so it must be caught first
-        # or a firewall DROP - the usual shape of disabled egress - would be
-        # reported as a plain timeout instead of the hint below.
+        response = exc.response  # None unless raise_for_status() raised this
+        if response is None:
+            return _message("error", f"HTTP error: {exc}")
+        body = response.text[:300] or exc
+        return _message("error", f"HTTP {response.status_code} from {response.url}: {body}")
+    except requests.ConnectionError as exc:
+        # ConnectTimeout subclasses both ConnectionError and Timeout, so this
+        # clause must stay above `except requests.Timeout` - otherwise a firewall
+        # DROP, the usual shape of disabled egress, reports as a plain timeout.
         return _message(
             "error",
             f"Could not reach {_host_of(exc)}: {exc}. Rossum functions have no "

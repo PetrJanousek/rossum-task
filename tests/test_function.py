@@ -1,7 +1,7 @@
 """
 Offline tests for the Rossum -> FinancialDocDesc -> PostBin hook.
 
-No network: the two Rossum calls and the sink POST are patched. Run with
+No network: the Rossum export call and the sink POST are patched. Run with
 
     python -m unittest discover -s tests -v
 """
@@ -23,7 +23,6 @@ from function import (
     map_document,
     parse_export,
     read_config,
-    resolve_queue_id,
     rossum_hook_request_handler,
     to_xml,
 )
@@ -64,9 +63,8 @@ def export_with(content, annotation_id=ANNOTATION_ID):
 def base_payload(**overrides):
     payload = {
         "rossum_authorization_token": "test-token",
-        "base_url": "https://example.rossum.app",
         "annotationId": ANNOTATION_ID,
-        "settings": {"postbin_url": "https://www.postb.in/BIN"},
+        "postbin_id": "BIN",
     }
     payload.update(overrides)
     return payload
@@ -98,16 +96,6 @@ class ParseExportTests(unittest.TestCase):
     def test_missing_results_key_is_a_clear_error(self):
         with self.assertRaises(ValueError):
             parse_export({}, ANNOTATION_ID)
-
-    def test_export_for_a_different_annotation_is_rejected(self):
-        with self.assertRaises(ValueError) as caught:
-            parse_export(export_with([], annotation_id="99999999"), ANNOTATION_ID)
-        self.assertIn("expected annotation", str(caught.exception))
-
-    def test_identity_check_compares_path_segment_not_substring(self):
-        """'123' is a substring of '.../1234' but must not be accepted."""
-        with self.assertRaises(ValueError):
-            parse_export(export_with([], annotation_id="1234"), "123")
 
     def test_first_non_empty_value_wins_for_a_repeated_schema_id(self):
         fields, _ = parse_export(
@@ -159,7 +147,8 @@ class ParseExportTests(unittest.TestCase):
             ANNOTATION_ID,
         )
         self.assertEqual(fields["currency"], "")
-        self.assertEqual(fields["amount_total"], "42")  # not "42.0"
+        # The extracted format is passed through, not reformatted (see A3).
+        self.assertEqual(fields["amount_total"], "42.0")
         self.assertEqual(fields["document_id"], "spaced")
 
 
@@ -351,53 +340,70 @@ class ReadConfigTests(unittest.TestCase):
 
         self.assertEqual(config.annotation_id, ANNOTATION_ID)
         self.assertEqual(config.sink_url, "https://www.postb.in/BIN")
-        self.assertEqual(config.base_url, "https://example.rossum.app")
 
     def test_missing_fields_are_all_named_at_once(self):
         with self.assertRaises(ValueError) as caught:
             read_config({})
         message = str(caught.exception)
 
-        for name in ("rossum_authorization_token", "base_url", "annotationId", "postbin_url"):
+        for name in ("rossum_authorization_token", "annotationId", "postbin_id"):
             self.assertIn(name, message)
 
-    def test_postbin_url_in_the_body_overrides_the_stored_setting(self):
-        config = read_config(base_payload(postbin_url="https://www.postb.in/FRESH"))
-        self.assertEqual(config.sink_url, "https://www.postb.in/FRESH")
+    def test_a_bin_id_in_the_hook_settings_is_ignored(self):
+        """The bin id must be in the invoke body; stored settings do not count."""
+        payload = base_payload(settings={"postbin_id": "STORED"})
+        del payload["postbin_id"]
+        with self.assertRaises(ValueError) as caught:
+            read_config(payload)
+        self.assertIn("postbin_id", str(caught.exception))
 
-    def test_annotation_id_can_come_from_a_nested_annotation_object(self):
+    def test_a_nested_annotation_object_is_not_a_substitute_for_annotationId(self):
+        """Manual-invoke only: event-style payloads must be rejected clearly."""
         payload = base_payload()
         del payload["annotationId"]
         payload["annotation"] = {"id": 555}
-        config = read_config(payload)
-
-        self.assertEqual(config.annotation_id, "555")
-
-    def test_a_non_http_sink_is_rejected_before_any_api_call(self):
-        for bad in ("file:///etc/passwd", "ftp://host/x", "not-a-url", "https://"):
-            with self.assertRaises(ValueError, msg=bad):
-                read_config(base_payload(postbin_url=bad))
+        with self.assertRaises(ValueError) as caught:
+            read_config(payload)
+        self.assertIn("annotationId", str(caught.exception))
 
     def test_token_is_kept_out_of_the_repr(self):
         config = read_config(base_payload())
         self.assertNotIn("test-token", repr(config))
 
 
-class ResolveQueueTests(unittest.TestCase):
-    def test_the_queue_id_is_the_last_segment_of_the_looked_up_url(self):
-        api = mock.Mock(spec=function.RossumAPI)
-        api.queue_url_of.return_value = "https://example.rossum.app/api/v1/queues/77/"
+class ExportRequestTests(unittest.TestCase):
+    def get(self, **response_attrs):
+        response = mock.Mock(**response_attrs)
+        patcher = mock.patch.object(requests, "get", return_value=response)
+        self.addCleanup(patcher.stop)
+        return patcher.start()
 
-        self.assertEqual(resolve_queue_id(ANNOTATION_ID, api), "77")
-        api.queue_url_of.assert_called_once_with(ANNOTATION_ID)
+    def test_export_calls_the_annotation_export_endpoint_with_the_token(self):
+        get = self.get(json=mock.Mock(return_value={"results": []}))
 
-    def test_an_unusable_queue_url_is_a_clear_error(self):
-        api = mock.Mock(spec=function.RossumAPI)
-        api.queue_url_of.return_value = ""
+        function.export_annotation("tok", ANNOTATION_ID)
+
+        url, kwargs = get.call_args.args[0], get.call_args.kwargs
+        self.assertEqual(
+            url, "https://foobar.rossum.app/api/v1/annotations/export"
+        )
+        self.assertEqual(kwargs["params"], {"format": "json", "id": ANNOTATION_ID})
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer tok")
+        self.assertEqual(kwargs["timeout"], function.REQUEST_TIMEOUT)
+
+    def test_a_non_json_response_names_the_url_and_the_first_bytes(self):
+        self.get(
+            json=mock.Mock(side_effect=ValueError("no json")),
+            url="https://foobar.rossum.app/api/v1/annotations/export",
+            status_code=200,
+            text="<html>login</html>",
+        )
 
         with self.assertRaises(ValueError) as caught:
-            resolve_queue_id(ANNOTATION_ID, api)
-        self.assertIn(ANNOTATION_ID, str(caught.exception))
+            function.export_annotation("tok", ANNOTATION_ID)
+
+        self.assertIn("annotations/export", str(caught.exception))
+        self.assertIn("<html>login</html>", str(caught.exception))
 
 
 class HandlerTests(unittest.TestCase):
@@ -414,19 +420,10 @@ class HandlerTests(unittest.TestCase):
         self.post = patcher.start()
         self.addCleanup(patcher.stop)
 
-        # The queue is always looked up; give every handler test one to find.
-        lookup = mock.patch.object(
-            function.RossumAPI,
-            "queue_url_of",
-            return_value="https://example.rossum.app/api/v1/queues/87654321",
-        )
-        self.queue_url_of = lookup.start()
-        self.addCleanup(lookup.stop)
-
     def patch_api(self, export=None, side_effect=None):
         api = mock.patch.object(
-            function.RossumAPI,
-            "export",
+            function,
+            "export_annotation",
             side_effect=side_effect,
             return_value=export if side_effect is None else None,
         )
@@ -445,9 +442,7 @@ class HandlerTests(unittest.TestCase):
         message = self.only_message(rossum_hook_request_handler(payload))
 
         self.assertEqual(message["type"], "info")
-        # The queue always comes from the annotation lookup, never from settings.
-        self.queue_url_of.assert_called_once_with(ANNOTATION_ID)
-        export.assert_called_once_with("87654321", ANNOTATION_ID)
+        export.assert_called_once_with("test-token", ANNOTATION_ID)
         url, body = self.posted[0]
         self.assertEqual(url, "https://www.postb.in/BIN")
         self.assertEqual(set(body), {"annotationId", "content"})
@@ -483,7 +478,6 @@ class HandlerTests(unittest.TestCase):
         message = self.only_message(rossum_hook_request_handler({}))
 
         self.assertEqual(message["type"], "error")
-        self.queue_url_of.assert_not_called()
         export.assert_not_called()
         self.assertEqual(self.posted, [])
 
@@ -522,7 +516,7 @@ class HandlerTests(unittest.TestCase):
         self.assertIn("postb.in", message["content"])
 
     def test_read_timeout_mentions_the_hook_deadline(self):
-        request = mock.Mock(url="https://example.rossum.app/api/v1/queues/1/export")
+        request = mock.Mock(url="https://example.rossum.app/api/v1/annotations/export")
         self.patch_api(side_effect=requests.ReadTimeout("slow", request=request))
         payload = base_payload()
 

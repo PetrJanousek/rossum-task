@@ -21,11 +21,9 @@ sequenceDiagram
     participant R as Rossum API
     participant P as PostBin
 
-    U->>H: {annotationId, base_url, token, settings}
-    Note over H: validate payload, incl. the sink URL
-    H->>R: GET /annotations/{id}
-    R-->>H: queue URL
-    H->>R: GET /queues/{qid}/export?format=json&id={id}
+    U->>H: {annotationId, postbin_id, token}
+    Note over H: validate payload
+    H->>R: GET /annotations/export?format=json&id={id}
     R-->>H: export JSON
     Note over H: parse → map → serialize → base64
     H->>P: POST {annotationId, content}
@@ -95,38 +93,28 @@ If no `tax_details` rows were extracted, the header totals `amount_total_base` /
 
 1. Create a serverless function hook in Rossum (Python, `default` library pack).
 2. Paste `function.py`; entry point `rossum_hook_request_handler`.
-3. Set the hook's settings:
-
-```json
-{ "postbin_url": "https://www.postb.in/<BIN_ID>" }
-```
-
-4. Give the hook a `token_owner` — without it Rossum does not inject
+3. Give the hook a `token_owner` — without it Rossum does not inject
    `rossum_authorization_token` and the function cannot call the API.
-5. Invoke it:
+4. Invoke it — both ids always come in the request body (the hook's stored
+   `settings` are deliberately not read; PostBin bins expire within minutes,
+   so a stored default would just go stale):
 
 ```bash
 curl -X POST "https://<org>.rossum.app/api/v1/hooks/<HOOK_ID>/invoke" \
   -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
-  -d '{"annotationId": "12345678"}'
+  -d '{"annotationId": "12345678", "postbin_id": "<BIN_ID>"}'
 ```
 
-The PostBin URL must be `https://www.postb.in/<BIN_ID>` — the `/b/` path is the
-browser UI, not the POST target.
+Only the bin id is configurable — the sink URL is always built as
+`https://www.postb.in/<BIN_ID>`, so the hook can never POST invoice data to any
+other host. (The `/b/<BIN_ID>` path you see in the browser is the UI, not the
+POST target; pass just the id.) Both endpoints are pinned in `function.py`: the
+Rossum API origin (`ROSSUM_BASE_URL`) and the PostBin origin (`POSTBIN_ORIGIN`).
 
 > **Outbound internet is disabled by default** for Rossum functions. Calls to the
 > Rossum API work out of the box, but the POST to PostBin requires egress to be
 > enabled for the organization. If it isn't, the function reports exactly that
 > rather than a bare timeout.
-
-### Overriding the sink per invocation
-
-A `postbin_url` at the top level of the invoke body takes precedence over the
-stored setting, so a test run can target a fresh bin without mutating the hook:
-
-```bash
--d '{"annotationId": "12345678", "postbin_url": "https://www.postb.in/OTHER"}'
-```
 
 ---
 
@@ -135,7 +123,7 @@ stored setting, so a test run can target a fresh bin without mutating the hook:
 | Path | Role |
 |---|---|
 | `function.py` | The function — paste this into Rossum |
-| `tests/test_function.py` | 49 offline tests; no network |
+| `tests/test_function.py` | 46 offline tests; no network |
 | `samples/sample_export.json` | Rossum export fixture used by the tests |
 | `samples/sample_invoke_payload.json` | Shape of a manual-invoke payload |
 | `scripts/local_smoke.py` | Map the fixture and print the XML — no account needed |
@@ -148,15 +136,13 @@ stored setting, so a test run can target a fresh bin without mutating the hook:
 The function is stdlib + `requests`; the tests need nothing else.
 
 ```bash
-python -m unittest discover -s tests -v      # 49 tests
+python -m unittest discover -s tests -v      # 46 tests
 python scripts/local_smoke.py                # eyeball the mapped XML
 ```
 
 They cover the parse/map/serialize pipeline and every error branch of the
 handler, including the ones that are easy to get wrong:
 
-- an export returned for a **different annotation** is rejected — comparing the
-  URL's last path segment, not a substring, so `123` doesn't match `.../1234`
 - row values (`item_*`, `tax_detail_*`) can never leak into header fields
 - an all-blank tax row must not consume a rate bucket
 - `requests.HTTPError` with `response is None` must not escape the handler
@@ -188,14 +174,14 @@ a dozen lines with one sanitisation gate that every value passes through.
 
 **The handler never raises.** Every path returns hook messages, because an
 uncaught exception in a Rossum function surfaces as an opaque failure. Error
-messages name the endpoint and the likely cause — `postbin_url` is validated
-before any API call, so a typo fails immediately instead of after two round
-trips and a POST of invoice data to an arbitrary host.
+messages name the endpoint and the likely cause. The required payload fields
+are checked before any API call, so a missing one fails immediately instead of
+after the export call.
 
 **Timeouts.** `POST /hooks/{id}/invoke` enforces a hard 30s wall clock that
-cannot be raised, and the injected token lives ~10 minutes. At most three
-sequential requests run, each capped at 8s, leaving room to return an error
-rather than being killed.
+cannot be raised, and the injected token lives ~10 minutes. At most two
+sequential requests run (export + sink), each capped at 8s, leaving room to
+return an error rather than being killed.
 
 ### Limitations
 
@@ -205,3 +191,5 @@ rather than being killed.
   exactly three.
 - The annotation must be in an exportable state; if it isn't, the export returns
   no results and the function says so.
+- Values are emitted exactly as extracted — no rounding, reformatting or locale
+  conversion. `42.0` stays `42.0`.

@@ -3,11 +3,21 @@ name = "rossum-postbin-export-hook"
 version = "1.0.0"
 description = "Rossum serverless hook: export an annotation as FinancialDocDesc XML and POST it base64-encoded to PostBin"
 readme = "README.md"
-requires-python = ">=3.9"
-# The function itself needs only the stdlib plus `requests`, which Rossum's
-# runtime provides in its default third-party library pack. Nothing to install
-# for deployment; `requests` is needed locally to run the tests.
-dependencies = ["requests"]
+requires-python = ">=3.12"
+# The function needs only the stdlib plus `requests` and `jmespath`, both of
+# which Rossum's runtime provides in its default third-party library pack.
+# Nothing to install for deployment; both are needed locally to run the tests.
+dependencies = ["requests", "jmespath"]
+
+[tool.basedpyright]
+# basedpyright defaults to "recommended", which flags every expression whose
+# type is Any. This hook is mostly JSON plumbing - requests' .json() and
+# jmespath.search() are Any by definition - so that mode reports noise, not
+# bugs. "standard" is upstream pyright's default and still catches real ones.
+typeCheckingMode = "standard"
+pythonVersion = "3.12"
+# requests and jmespath ship no type stubs.
+reportMissingTypeStubs = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
